@@ -1,56 +1,5 @@
-import pytesseract
-import easyocr
 from PIL import Image
 import os
-
-'''
-# Set Tesseract OCR path (modify based on your OS)
-pytesseract.pytesseract.tesseract_cmd = r"/opt/homebrew/bin/tesseract"
-
-def extract_text_tesseract(image_path):
-    """Extracts text from an image using Tesseract OCR."""
-    img = Image.open(image_path)
-    extracted_text = pytesseract.image_to_string(img)
-    return extracted_text.strip()
-
-def extract_text_easyocr(image_path):
-    """Extracts text from an image using EasyOCR."""
-    reader = easyocr.Reader(['en'])  # Language: English
-    results = reader.readtext(image_path, detail=0)
-    return " ".join(results)
-
-def extract_text(image_path, method="tesseract"):
-    """Extract text using selected OCR method."""
-    if method == "tesseract":
-        return extract_text_tesseract(image_path)
-    elif method == "easyocr":
-        return extract_text_easyocr(image_path)
-    else:
-        raise ValueError("Invalid method. Use 'tesseract' or 'easyocr'.")
-
-# Example Usage
-if __name__ == "__main__":
-    image_path = "/Users/sanj/Documents/Projects/C532/grocery_bill/data/bill1.jpeg"
-    raw_text = extract_text(image_path, method="tesseract")
-    print("\nExtracted Text:\n", raw_text)
-'''
-'''
-import easyocr
-
-def extract_text_easyocr(image_path):
-    """Extracts text from an image using EasyOCR."""
-    reader = easyocr.Reader(['en'])  # English language
-    results = reader.readtext(image_path, detail=0)  # Get extracted text
-    return "\n".join(results)
-
-# Example Usage
-if __name__ == "__main__":
-    image_path = "/Users/sanj/Documents/Projects/C532/grocery_bill/data/bill1.jpeg"
-    extracted_text = extract_text_easyocr(image_path)
-    print("\nExtracted Text (EasyOCR):\n", extracted_text)
-
-'''
-
 import easyocr
 import re
 

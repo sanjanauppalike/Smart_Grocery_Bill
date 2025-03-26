@@ -227,29 +227,30 @@ def parse_grocery_bill(text):
     try:
         structured_data = openai_model.predict(prompt.format(text=text))
 
-        # ✅ Debug: Print the raw OpenAI response before parsing
+        # Debug: Print the raw OpenAI response before parsing
         print("🔹 OpenAI Raw Response:", structured_data)
 
-        # ✅ Remove Markdown-like triple backticks and extra formatting
+        # Remove Markdown-like triple backticks and extra formatting
         structured_data = structured_data.strip("```json").strip("```").strip()
 
-        # ✅ Step 2: Remove Non-JSON Explanations (if OpenAI includes additional text)
+        # Step 2: Remove Non-JSON Explanations (if OpenAI includes additional text)
         json_match = re.search(r"\[\s*\{.*\}\s*\]", structured_data, re.DOTALL)
         if json_match:
             structured_data = json_match.group(0)  # Extract only JSON part
 
-        # ✅ Ensure OpenAI response is valid JSON
+        # Ensure OpenAI response is valid JSON
         parsed_json = json.loads(structured_data)
 
-        # ✅ Sanitize price values
+        # Sanitize price values
         for item in parsed_json:
             item["price"] = sanitize_price(item["price"])
+            #item["category"] = item["category"].strip().upper()
 
         if isinstance(parsed_json, list) and all(isinstance(entry, dict) for entry in parsed_json):
-            return parsed_json  # ✅ Correct format
+            return parsed_json  # Correct format
         else:
             raise ValueError("OpenAI returned an invalid JSON format")
 
     except json.JSONDecodeError as e:
-        print("❌ Failed to parse OpenAI response:", repr(structured_data))  # Debugging step
+        print("Failed to parse OpenAI response:", repr(structured_data)) 
         raise ValueError(f"Failed to parse OpenAI response: {e}")

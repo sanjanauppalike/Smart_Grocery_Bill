@@ -1,0 +1,16 @@
+myenv/
+.env
+ashay
+memory.json
+temp/
+uploads/
+data/
+
+# macOS system file
+.DS_Store
+src/.DS_Store
+
+# Python bytecode files and cache
+__pycache__/
+*.pyc
+

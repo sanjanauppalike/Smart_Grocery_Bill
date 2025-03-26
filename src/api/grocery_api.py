@@ -1,267 +1,363 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os
+import os, uuid, re, json
 from src.ocr.ocr_extractor import extract_text_easyocr
 from src.parsing.langchain_parser import parse_grocery_bill
-from src.knowledge_graph.neo4j_connector import GroceryGraph
-from src.knowledge_graph.query_handler import query_total_spent
+from src.knowledge_graph.neo4j_connector import GroceryGraph, get_existing_labels_and_relationships
+from src.knowledge_graph.query_handler import query_total_spent  # if needed
 from langchain.prompts import PromptTemplate
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 from langchain.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import HumanMessage, AIMessage
 import requests
-import uuid
-import re
+from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # Allow frontend to communicate with API
+CORS(app)
 
 grocery_graph = GroceryGraph()
 
 UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Ensure the directory exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# ✅ Load OpenAI API Key
+# Load OpenAI API Key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY is missing. Please set it in the environment variables.")
+    raise ValueError("OPENAI_API_KEY is missing. Please set it in the environment variables.")
 
-# ✅ Initialize OpenAI Model Globally
-openai_model = ChatOpenAI(model_name="gpt-4", openai_api_key=OPENAI_API_KEY)
+# Initialize OpenAI model globally
+openai_model = ChatOpenAI(model_name="gpt-4", openai_api_key=OPENAI_API_KEY, temperature=0)
 
-@app.route("/")
-def home():
-    return jsonify({"message": "Welcome to Grocery API!"})
+# Initialize conversation memory
+#memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-@app.route("/upload_bill", methods=["POST"])
-def upload_bill():
-    """Handles grocery bill image upload and processing."""
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+class MemoryManager:
+    def __init__(self, max_messages=4, memory_file="memory.json"):
+        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        self.max_messages = max_messages
+        self.memory_file = memory_file
+        self.session_id = str(uuid.uuid4())[:8]  # Generate a unique session ID
+        self.load_memory()
 
-    file = request.files["file"]
-    file_path = os.path.join("uploads", file.filename)
-    file.save(file_path)
+    def load_memory(self):
+        if os.path.exists(self.memory_file):
+            try:
+                with open(self.memory_file, 'r') as f:
+                    data = json.load(f)
+                    self.session_id = data.get('session_id', self.session_id)
+                    messages = data.get('messages', [])
+                    for msg in messages:
+                        if msg['type'] == 'human':
+                            self.memory.chat_memory.add_message(HumanMessage(content=msg['content']))
+                        else:
+                            self.memory.chat_memory.add_message(AIMessage(content=msg['content']))
+            except Exception as e:
+                print(f"Error loading memory: {e}")
 
-    # Step 1: Extract text using OCR
-    extracted_text = extract_text_easyocr(file_path)
+    def save_memory(self):
+        try:
+            messages = []
+            for msg in self.memory.chat_memory.messages:
+                messages.append({
+                    'type': 'human' if isinstance(msg, HumanMessage) else 'ai',
+                    'content': msg.content,
+                    'timestamp': datetime.now().isoformat()
+                })
+            
+            with open(self.memory_file, 'w') as f:
+                json.dump({
+                    'session_id': self.session_id,
+                    'messages': messages,
+                    'last_updated': datetime.now().isoformat()
+                }, f)
+        except Exception as e:
+            print(f"Error saving memory: {e}")
 
-    # Step 2: Parse the extracted text into structured JSON
-    structured_data = parse_grocery_bill(extracted_text)
-
-    # ✅ Extract the list from `structured_data`
-    if isinstance(structured_data, dict) and "items" in structured_data:
-        structured_data = structured_data["items"]  # ✅ Extract the list
-
-    if not isinstance(structured_data, list) or not all(isinstance(entry, dict) for entry in structured_data):
-        return jsonify({"error": "Parsed data is not a valid list"}), 500
-    
-    # ✅ Fix: Ensure key renaming only happens if "name" exists
-    for entry in structured_data:
-        if "name" in entry:
-            entry["item"] = entry.pop("name")  # Rename "name" -> "item"
-
-
-    # Debugging: Print structured data before storing
-    print("Final Structured Data:", structured_data)
-
-    # ✅ Generate a unique bill ID
-    bill_id = str(uuid.uuid4())[:8]
-
-    grocery_graph.store_grocery_data("Sanjana", structured_data, bill_id)
-
-    return jsonify({"message": "Bill processed successfully!", "bill_id": bill_id, "data": structured_data})
-
-
-
-@app.route("/spending/<category>", methods=["GET"])
-def get_spending(category):
-    """Fetches total spending for a category."""
-    total_spent = query_total_spent(category)
-    return jsonify({"category": category, "total_spent": total_spent})
-
-'''
-@app.route("/ask", methods=["POST"])
-def ask_question():
-    """Handles user queries about grocery spending, dynamically selecting the right data source."""
-    data = request.json
-    user_question = data.get("question", "").lower()
-
-    if not user_question:
-        return jsonify({"error": "Question cannot be empty."}), 400
-
-    # ✅ Step 1: Let GPT Decide How to Answer the Question
-    query_decision_prompt = f"""
-    You are an AI assistant with access to a grocery spending knowledge graph (Neo4j).
-
-    The user asked: "{user_question}"
-
-    Available API Endpoints for Data Retrieval:
-    1️⃣ /spending/total → Returns total grocery spending.
-    2️⃣ /spending/<category> → Returns total spending in a specific category.
-    3️⃣ /most_expensive_item → Returns the most expensive item purchased.
-    4️⃣ /cheapest_item → Returns the least expensive item purchased.
-    5️⃣ /most_purchased_item → Returns the most frequently purchased item.
-    6️⃣ /items_in_category/<category> → Returns a list of all items in a given category.
-    7️⃣ /savings_tips → Returns budget-friendly grocery tips.
-
-    🎯 Your Task:
-    - Determine which API call (if any) should be used to answer the question.
-    - If multiple APIs could be used, choose the most relevant one.
-    - If the question doesn't require database retrieval, generate a useful response yourself.
-    - If calling an API, respond with only the endpoint URL (e.g., "/spending/fruits").
-
-    Do NOT return anything except a single API path or a direct answer.
-    """
-
-    gpt_response = openai_model.predict(query_decision_prompt).strip()
-
-    # ✅ Step 2: Check if GPT returned an API call
-    if gpt_response.startswith("/"):  # If GPT suggests an API call
-        api_endpoint = f"http://127.0.0.1:5000{gpt_response}"
-        res = requests.get(api_endpoint)
-
-        if res.status_code == 200:
-            api_data = res.json()
-            return jsonify({"response": format_api_response(api_data, gpt_response)})
+    def add_message(self, message, is_human=True):
+        # Check if we need to remove old messages
+        while len(self.memory.chat_memory.messages) >= self.max_messages:
+            self.memory.chat_memory.messages.pop(0)
+        
+        if is_human:
+            self.memory.chat_memory.add_message(HumanMessage(content=message))
         else:
-            return jsonify({"response": f"Sorry, I couldn't fetch the data for {gpt_response}."})
+            self.memory.chat_memory.add_message(AIMessage(content=message))
+        
+        self.save_memory()
 
-    else:
-        # ✅ GPT provided a direct answer, return as-is
-        return jsonify({"response": gpt_response})
+    def get_memory(self):
+        return self.memory.load_memory_variables({})["chat_history"]
 
-def format_api_response(api_data, endpoint):
-    """Formats API response for better readability."""
-    if "/spending/" in endpoint:
-        category = endpoint.split("/")[-1]
-        return f"You spent ${api_data.get('total_spent', 0.0):.2f} on {category}."
-    elif "/most_expensive_item" in endpoint:
-        return f"Your most expensive item was {api_data['item']} costing ${api_data['price']:.2f}."
-    elif "/cheapest_item" in endpoint:
-        return f"Your cheapest item was {api_data['item']} costing ${api_data['price']:.2f}."
-    elif "/most_purchased_item" in endpoint:
-        return f"Your most purchased item is {api_data['item']}, which you bought {api_data['quantity']} times."
-    elif "/items_in_category/" in endpoint:
-        category = endpoint.split("/")[-1]
-        items = ", ".join(api_data.get("items", []))
-        return f"Items in {category}: {items}."
-    elif "/savings_tips" in endpoint:
-        return f"Here are some budget-friendly grocery tips: {api_data.get('tips', 'No tips available.')}"
-    return "Data retrieved, but couldn't format the response."
+    def clear_memory(self):
+        self.memory.clear()
+        self.session_id = str(uuid.uuid4())[:8]  # Generate a new session ID
+        self.save_memory()
 
-'''
+# Initialize memory manager
+memory_manager = MemoryManager()
 
+def format_query_result(records, user_question):
+    """Uses retrieved Neo4j records to generate a conversational answer."""
+    if not records:
+        return "No relevant data found in your grocery history."
 
-@app.route("/ask", methods=["POST"])
-def ask_question():
-    """Handles user queries dynamically using Neo4j and GPT."""
-    data = request.json
-    user_question = data.get("question", "").lower()
-    history = data.get("history", []) 
+    rag_prompt = f"""
+    You are an AI assistant summarizing grocery spending data.
+    The user asked: "{user_question}"
+    Here are the raw query results from the grocery database:
+    {json.dumps(records, indent=2)}
 
-    if not user_question:
-        return jsonify({"error": "Question cannot be empty."}), 400
+    Generate a clear and concise answer for the user.
+    """
+    response = openai_model.predict(rag_prompt).strip()
+    return response
+
+def validate_cypher_query(query, labels, relationships, properties):
+    """Ensures Cypher query only uses valid labels, relationships, and properties."""
     
-    # ✅ Step 1: Check if the answer is available in `history`
-    history_response = check_history_for_answer(user_question, history)
-    if history_response:
-        return jsonify({"response": history_response})
+    for label in labels:
+        if re.search(rf"\b{label}\.", query):
+            props_in_query = re.findall(rf"{label}\.([a-zA-Z0-9_]+)", query)
+            for prop in props_in_query:
+                if prop not in properties.get(label, []):
+                    print(f"⚠️ Invalid property detected: {label}.{prop}")
+                    return False  # Query is invalid
 
+    for relationship in relationships:
+        if relationship not in query:
+            print(f"⚠️ Missing relationship: {relationship}")
 
-    # ✅ Step 1: Ask GPT to generate the Cypher query
+    return True  # Query is valid
+
+def get_existing_labels_and_relationships(driver):
+    """Fetches valid labels, relationships, and properties from Neo4j to prevent invalid queries."""
+    with driver.session() as session:
+        labels_result = session.run("CALL db.labels() YIELD label RETURN COLLECT(label) AS labels")
+        relationships_result = session.run("CALL db.relationshipTypes() YIELD relationshipType RETURN COLLECT(relationshipType) AS relationships")
+        properties_result = session.run("CALL db.schema.nodeTypeProperties() YIELD nodeLabels, propertyName RETURN nodeLabels, COLLECT(propertyName) AS properties")
+
+        labels = labels_result.single()["labels"]
+        relationships = relationships_result.single()["relationships"]
+        properties = {row["nodeLabels"][0]: row["properties"] for row in properties_result}
+
+        return labels, relationships, properties
+
+def generate_cypher_query(user_question, labels, relationships, properties):
+    """Generates a Cypher query based on the question and valid schema."""
+    
     cypher_prompt = f"""
     You are an AI assistant with access to a grocery spending knowledge graph (Neo4j).
     The user asked: "{user_question}"
 
-    Generate an optimized Cypher query based on the question intent:
-    - If the question asks for "on what did I spend the most?", sum spending per category and return the highest one.
-    - If the question asks for "how much did I spend on X category?", sum the price of items belonging to that category.
-    - If the question asks for "what is my most expensive item?", order by price and return the top item.
-    - If the question asks for "what item do I buy the most?", count the occurrences of items and return the most frequent one.
-    
-    Database Schema:
-    - (:User)-[:BOUGHT]->(:Item)-[:BELONGS_TO]->(:Category)
-    - User nodes contain `name`
-    - Item nodes contain `name` and `price`
-    - Category nodes contain `name`
+    Use **only** these valid schema elements:
+    - **Node Labels:** {labels}
+    - **Relationships:** {relationships}
+    - **Properties for Each Label:** {json.dumps(properties, indent=2)}
 
-    Example Inputs & Expected Cypher Queries:
-    - "On what did I spend the most?" → `MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item)-[:BELONGS_TO]->(c:Category) RETURN c.name, SUM(i.price) AS total_spent ORDER BY total_spent DESC LIMIT 1`
-    - "How much did I spend on Fruits?" → `MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item)-[:BELONGS_TO]->(c:Category {{name: 'Fruits'}}) RETURN SUM(i.price) AS total_spent`
-    - "What is my most expensive item?" → `MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item) RETURN i.name, i.price ORDER BY i.price DESC LIMIT 1`
-    - "What item do I buy the most?" → `MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item) RETURN i.name, COUNT(i) AS frequency ORDER BY frequency DESC LIMIT 1`
+    ⚠️ **Rules:**
+    - **Do not use any properties that are not listed above.**
+    - Ensure **case-insensitive matching** for categories using `toLower()`.
+    - **Alias aggregations** like `SUM(i.price) AS total_spent`.
+    - **Ensure relationships exist** before using them in the query.
+    - **If querying multiple categories**, use `WHERE toLower(c.name) IN ['category1', 'category2']`.
 
-    Output only the Cypher query.
+    ### Example Queries:
+    - "What is my most expensive item?" → 
+      ```cypher
+      MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item)
+      RETURN i.name, i.price ORDER BY i.price DESC LIMIT 1
+      ```
+    - "On what did I spend the most?" → 
+      ```cypher
+      MATCH (u:User {{name: 'Sanjana'}})-[:BOUGHT]->(i:Item)-[:BELONGS_TO]->(c:Category)
+      RETURN c.name, SUM(i.price) AS total_spent ORDER BY total_spent DESC LIMIT 1
+      ```
+    - "How much did I spend on produce, bakery, and snacks?" →
+      ```cypher
+      MATCH (u:User {{name:'Sanjana'}})-[:BOUGHT]->(i:Item)-[:BELONGS_TO]->(c:Category)
+      WHERE toLower(c.name) IN ['produce', 'bakery', 'snacks']
+      RETURN SUM(i.price) AS total_spent
+      ```
+    - "What item do I buy the most?" →
+      ```cypher
+      MATCH (u:User {{name: 'Sanjana'}})-[r:BOUGHT]->(i:Item)
+      RETURN i.name, SUM(r.quantity) AS item_freq ORDER BY item_freq DESC LIMIT 1
+      ```
+
+    **Output only the Cypher query.**
     """
 
-    #cypher_query = openai_model.predict(cypher_prompt).strip()
     cypher_query = openai_model.predict(cypher_prompt).strip().strip("`").strip('"')
-    #cypher_query = cypher_query.replace("{name: '", "{name: toLower('")
-    cypher_query = re.sub(r"\{name: '([^']+)'\}", r"{name: toLower('\1')}", cypher_query)
-    
-    print(f"🔍 Generated Cypher Query:\n{cypher_query}")  # ✅ Log query for debugging
 
-    # ✅ Step 2: Execute the generated Cypher query
+    # ✅ Ensure category names are case-insensitive
+    cypher_query = re.sub(r"\{name: '([^']+)'\}", r"{name: toLower('\1')}", cypher_query)
+
+    # ✅ Ensure aliasing is done properly
+    cypher_query = re.sub(r"AS total_spent\s+AS\s+\w+", "AS total_spent", cypher_query)
+
+    print(f"🔍 Generated Cypher Query:\n{cypher_query}")  # Debugging
+    return cypher_query
+
+# -------------------------
+# Helper: Execute Cypher query and return results
+def execute_cypher_query(cypher_query):
+    """Executes a Cypher query and returns the results."""
     try:
         with grocery_graph.driver.session() as session:
             result = session.run(cypher_query)
             records = result.data()
-            
-            print(f"🔍 Query Results: {records}")  # ✅ Log query results
-            
-            if records:
-                return jsonify({"response": format_query_result(records, user_question)})
-            else:
-                return jsonify({"response": "No relevant data found in your grocery history."})
+            print(f"🔍 Query Results: {records}")
+            return records if records else None
     except Exception as e:
-        print(f"❌ Cypher Execution Error: {str(e)}")  # ✅ Log the exact error
-        return jsonify({"error": f"Failed to execute query: {str(e)}"}), 500
+        print(f"❌ Cypher Execution Error: {str(e)}")
+        return None
 
-def check_history_for_answer(user_question, history):
-    """Checks processed bills for relevant information before querying Neo4j."""
+# -------------------------
+# Helper: Check history for answer using conversation buffer
+def check_history_for_answer(user_question, past_messages):
+    """Generates a response from past conversation history if relevant."""
+    if not past_messages:
+        return None
+    history_text = "\n".join([msg.content for msg in past_messages])
+    history_prompt = f"""
+    The user asked: "{user_question}"
+    Based on the following past conversation history:
+    {history_text}
     
-    if not history:
-        return None  # ✅ No past processed data
+    Provide a concise answer using the historical data.
+    """
+    response = openai_model.predict(history_prompt).strip()
+    return response if response else None
+
+# -------------------------
+# /upload_bill endpoint 
+@app.route("/upload_bill", methods=["POST"])
+def upload_bill():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
+
+    extracted_text = extract_text_easyocr(file_path)
+    structured_data = parse_grocery_bill(extracted_text)
+    if isinstance(structured_data, dict) and "items" in structured_data:
+        structured_data = structured_data["items"]
+    if not isinstance(structured_data, list):
+        return jsonify({"error": "Parsed data is not a valid list"}), 500
+    for entry in structured_data:
+        if "name" in entry:
+            entry["item"] = entry.pop("name")
+
+    print("Final Structured Data:", structured_data)
+    bill_id = str(uuid.uuid4())[:8]
+    grocery_graph.store_grocery_data("Sanjana", structured_data, bill_id)
+    return jsonify({"message": "Bill processed successfully!", "bill_id": bill_id, "data": structured_data})
+
+
+#@app.route("/spending/<category>", methods=["GET"])
+@app.route("/spending/<path:category>", methods=["GET"])
+def get_spending(category):
+    total_spent = query_total_spent(category)
+    return jsonify({"category": category, "total_spent": total_spent})
+
+
+@app.route("/ask", methods=["POST"])
+def ask_question():
+    """Handles user queries dynamically using intent classification, Neo4j, and AI."""
+    data = request.json
+    user_question = data.get("question", "").strip().lower()
+
+    if not user_question:
+        return jsonify({"error": "Question cannot be empty."}), 400
+
+    # Add user question to memory
+    memory_manager.add_message(user_question, is_human=True)
+
+    # Fetch Schema from Neo4j **only once**
+    labels, relationships, properties = get_existing_labels_and_relationships(grocery_graph.driver)
+
+    # Generate Cypher Query Using Only Valid Schema
+    cypher_query = generate_cypher_query(user_question, labels, relationships, properties)
+
+    # Validate Query Before Execution
+    if not validate_cypher_query(cypher_query, labels, relationships, properties):
+        return jsonify({"error": "Generated query contains invalid fields. Please refine your question."}), 400
+
+    # Check Memory for Previously Asked Questions
+    past_conversations = memory_manager.get_memory()
+    print(f"🧠 Stored Memory: {past_conversations}")  # Debugging
+
+    for i, past in enumerate(past_conversations):
+        if hasattr(past, "role") and past.role == "human" and user_question in past.content.lower():
+            if i + 1 < len(past_conversations) and getattr(past_conversations[i + 1], "role", None) == "ai":
+                print("🔍 Reusing previous query intent from memory.")
+                return jsonify({"response": past_conversations[i + 1].content})
+
+    # Intent Classification using AI
+    intent_prompt = f"""
+    You are an AI assistant analyzing grocery spending.
+    The user asked: "{user_question}"
     
-    if "most expensive item" in user_question:
-        # ✅ Find the most expensive item in history
-        most_expensive = max(history, key=lambda x: float(x["price"]), default=None)
-        if most_expensive:
-            return f"Your most expensive item was {most_expensive['item']} costing ${most_expensive['price']}."
+    Determine the intent from the following options:
+    - "database_query": if the question requires querying Neo4j.
+    - "session_data": if the question can be answered from past conversation history.
+    - "rag": if the question needs both Neo4j and past conversation data.
+    - "ai_inference": if no structured data is available, generate an answer using general knowledge.
+    
+    Output only one of: "database_query", "session_data", "rag", or "ai_inference".
+    """
+    intent = openai_model.predict(intent_prompt).strip().strip('"')
+    print(f"🔍 AI Intent Prediction: {intent}")
 
-    elif "most purchased item" in user_question:
-        # ✅ Find the most frequently purchased item
-        item_counts = {}
-        for entry in history:
-            item_counts[entry["item"]] = item_counts.get(entry["item"], 0) + int(entry["quantity"])
-        
-        most_purchased = max(item_counts, key=item_counts.get, default=None)
-        if most_purchased:
-            return f"Your most purchased item is {most_purchased}, bought {item_counts[most_purchased]} times."
+    if intent in ["database_query", "rag"]:
+        records = execute_cypher_query(cypher_query)
+        if records:
+            # RAG: Combine DB Data + Memory Context
+            rag_prompt = f"""
+            The user asked: "{user_question}"
+            
+            Here is the data retrieved from the database:
+            {json.dumps(records, indent=2)}
+            
+            Here is the past conversation history:
+            {json.dumps([msg.content for msg in past_conversations], indent=2)}
+            
+            Generate a clear, detailed, and conversational answer based on this information.
+            """
+            ai_response = openai_model.predict(rag_prompt).strip()
+            memory_manager.add_message(ai_response, is_human=False)
+            return jsonify({"response": ai_response})
 
-    elif "spend on" in user_question:
-        # ✅ Find total spent on a category
-        category_name = user_question.split("spend on")[-1].strip().lower()
-        total_spent = sum(float(entry["price"]) for entry in history if entry["category"].lower() == category_name)
+    elif intent == "session_data":
+        history_response = check_history_for_answer(user_question, past_conversations)
+        if history_response:
+            memory_manager.add_message(history_response, is_human=False)
+            return jsonify({"response": history_response})
 
-        if total_spent > 0:
-            return f"You spent ${total_spent:.2f} on {category_name}."
+    elif intent == "ai_inference":
+        ai_fallback_prompt = f"""
+        The user asked: "{user_question}"
+        Generate an answer based solely on general grocery spending knowledge.
+        """
+        fallback_response = openai_model.predict(ai_fallback_prompt).strip()
+        memory_manager.add_message(fallback_response, is_human=False)
+        return jsonify({"response": fallback_response})
+    
+    return jsonify({"response": "I'm not sure how to answer that. Could you clarify?"})
 
-    return None  # ✅ If no relevant data found in history
 
-def format_query_result(records, user_question):
-    """Formats the database query results into a readable response."""
-    if "spend the most" in user_question:
-        return f"You spent the most on {records[0]['c.name']}, totaling ${records[0]['total_spent']:.2f}."
-    elif "spend on" in user_question:
-        return f"You spent ${records[0]['total_spent']:.2f} on this category."
-    elif "most expensive item" in user_question:
-        return f"Your most expensive item was {records[0]['i.name']} costing ${records[0]['i.price']:.2f}."
-    elif "most purchased item" in user_question:
-        return f"Your most purchased item is {records[0]['i.name']}, bought {records[0]['frequency']} times."
-    else:
-        return f"Here’s what I found: {records}"
+# Endpoint to check conversation memory
+@app.route("/memory", methods=["GET"])
+def get_memory():
+    memory_data = memory_manager.get_memory()
+    return jsonify({
+        "chat_history": [msg.content for msg in memory_data],
+        "session_id": memory_manager.session_id,
+        "message_count": len(memory_data)
+    })
 
 if __name__ == "__main__":
     app.run(debug=True)
