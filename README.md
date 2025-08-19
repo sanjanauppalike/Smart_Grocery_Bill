@@ -1,4 +1,4 @@
-# Grocery Bill Analyzer
+# Grocery Bill Analyzer With LLM & RAG
 
 A sophisticated application that leverages advanced NLP, OCR, and AI technologies to transform grocery bills into actionable insights. The system uses a combination of cutting-edge technologies to provide intelligent analysis of spending patterns and natural conversation about grocery purchases.
 
